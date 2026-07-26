@@ -636,6 +636,14 @@ class OpenClawWeChatClient:
 
             logger.info(f"Received from WeChat: {content[:50]}...")
 
+            # 使用流式响应支持 Block Streaming
+            await self.call_openclaw_stream(content, openid, msg_type_in)
+            openid = data.get("openid", "")
+            content = data.get("content", "")
+            msg_type_in = data.get("msg_type", "text")
+
+            logger.info(f"Received from WeChat: {content[:50]}...")
+
             response = await self.call_openclaw(content, msg_type_in)
 
             if response:
@@ -732,35 +740,208 @@ class OpenClawWeChatClient:
                     return self._build_self_healing_message("chat_api_disabled")
                 
                 elif response.status_code == 401:
-                    # 认证错误
+                    # 认证错误 - 需要区分 Token 缺失 vs Token 无效
+                    error_detail = response.text
                     logger.error(f"[API] 401 错误: 认证失败")
-                    logger.error(f"[API] 响应内容: {response.text[:200]}")
-                    return self._build_self_healing_message("auth_failed")
+                    logger.error(f"[API] 响应内容: {error_detail[:200]}")
+                    
+                    # 根据是否携带 Token 判断错误类型
+                    if not self.api_key:
+                        logger.error(f"[API] 原因: 未配置 API Key（OPENCLAW_API_KEY 环境变量或 gateway.auth.token）")
+                        return self._build_self_healing_message("auth_token_missing", error_detail)
+                    else:
+                        logger.error(f"[API] 原因: Token 无效或已过期")
+                        return self._build_self_healing_message("auth_token_invalid", error_detail)
+                
+                elif response.status_code == 403:
+                    # 权限不足
+                    error_detail = response.text
+                    logger.error(f"[API] 403 错误: 权限不足")
+                    logger.error(f"[API] 响应内容: {error_detail[:200]}")
+                    return self._build_self_healing_message("permission_denied", error_detail)
+                
+                elif response.status_code in (502, 503):
+                    # 服务不可用
+                    error_detail = response.text
+                    logger.error(f"[API] {response.status_code} 错误: 服务不可用")
+                    logger.error(f"[API] 响应内容: {error_detail[:200]}")
+                    return self._build_self_healing_message("service_unavailable", error_detail)
                 
                 else:
-                    logger.error(f"[API] 错误 {response.status_code}: {response.text[:200]}")
-                    return f"⚠️ OpenClaw 服务异常 ({response.status_code})\n\n请稍后重试，或发送 /status 查看状态。"
+                    error_detail = response.text
+                    logger.error(f"[API] 错误 {response.status_code}: {error_detail[:200]}")
+                    return self._build_self_healing_message("unknown", f"HTTP {response.status_code}: {error_detail}")
 
-        except httpx.ConnectError:
+        except httpx.ConnectError as e:
             logger.error(f"[API] 连接失败: 无法连接到 {self.openclaw_url}")
             logger.error(f"[API] 请检查: 1) OpenClaw 是否运行 2) 端口是否正确 3) 防火墙设置")
             return self._build_self_healing_message("connection_failed")
         
-        except httpx.TimeoutException:
-            logger.error(f"[API] 请求超时 (120秒)")
-            return "⚠️ OpenClaw 响应超时\n\n请稍后重试。"
-        
         except Exception as e:
             logger.error(f"[API] 未知错误: {type(e).__name__}: {e}")
-            return f"⚠️ 连接异常\n\n错误信息: {str(e)}\n\n请发送 /status 查看状态。"
+            return self._build_self_healing_message("unknown", str(e))
 
-    def _build_self_healing_message(self, error_type: str) -> str:
+    async def call_openclaw_stream(self, message: str, openid: str, msg_type: str = "text"):
+        """调用 OpenClaw API 并流式发送响应（Block Streaming）"""
+        logger.info(f"[API] 调用 OpenClaw (stream): url={self.openclaw_url}/v1/chat/completions")
+        
+        try:
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            url = f"{self.openclaw_url}/v1/chat/completions"
+
+            payload = {
+                "model": "default",
+                "messages": [
+                    {"role": "user", "content": message}
+                ],
+                "stream": True  # 启用流式响应
+            }
+
+            accumulated = ""
+            chunk_count = 0
+            min_chunk_size = 2000  # 最小累积字符数才发送
+            
+            async with httpx.AsyncClient(timeout=120) as client:
+                async with client.stream("POST", url, json=payload, headers=headers) as response:
+                    logger.info(f"[API] 响应状态码: {response.status_code}")
+                    
+                    if response.status_code == 200:
+                        async for line in response.aiter_lines():
+                            if line.startswith("data: "):
+                                data_str = line[6:]  # 去掉 "data: " 前缀
+                                if data_str == "[DONE]":
+                                    # 发送剩余内容
+                                    if accumulated.strip():
+                                        await self.send_message({
+                                            "type": "chat_response",
+                                            "openid": openid,
+                                            "content": accumulated.strip(),
+                                            "client_version": CLIENT_VERSION
+                                        })
+                                        chunk_count += 1
+                                        logger.info(f"[API] 发送最终块: {len(accumulated)} 字符")
+                                    break
+                                
+                                try:
+                                    import json
+                                    data = json.loads(data_str)
+                                    delta = data.get("choices", [{}])[0].get("delta", {})
+                                    content_chunk = delta.get("content", "")
+                                    
+                                    if content_chunk:
+                                        accumulated += content_chunk
+                                        
+                                        # 累积到一定量或遇到换行时发送
+                                        if len(accumulated) >= min_chunk_size or content_chunk.endswith("\n"):
+                                            await self.send_message({
+                                                "type": "chat_response",
+                                                "openid": openid,
+                                                "content": accumulated.strip(),
+                                                "client_version": CLIENT_VERSION
+                                            })
+                                            chunk_count += 1
+                                            logger.info(f"[API] 发送块 #{chunk_count}: {len(accumulated)} 字符")
+                                            accumulated = ""
+                                            
+                                            # 限流：每个块之间稍微等待
+                                            import asyncio
+                                            await asyncio.sleep(0.3)
+                                
+                                except json.JSONDecodeError:
+                                    continue
+                        
+                        logger.info(f"[API] 流式响应完成，共发送 {chunk_count} 条消息")
+                    
+                    elif response.status_code == 401:
+                        # 认证错误 - 需要区分 Token 缺失 vs Token 无效
+                        error_detail = await response.aread()
+                        error_text = error_detail.decode('utf-8') if error_detail else ""
+                        logger.error(f"[API] 401 错误: 认证失败")
+                        logger.error(f"[API] 响应内容: {error_text[:200]}")
+                        
+                        # 根据是否携带 Token 判断错误类型
+                        error_msg = self._build_self_healing_message(
+                            "auth_token_missing" if not self.api_key else "auth_token_invalid",
+                            error_text
+                        )
+                        await self.send_message({
+                            "type": "chat_response",
+                            "openid": openid,
+                            "content": error_msg,
+                            "client_version": CLIENT_VERSION
+                        })
+                    
+                    elif response.status_code == 403:
+                        # 权限不足
+                        error_detail = await response.aread()
+                        error_text = error_detail.decode('utf-8') if error_detail else ""
+                        logger.error(f"[API] 403 错误: 权限不足")
+                        logger.error(f"[API] 响应内容: {error_text[:200]}")
+                        await self.send_message({
+                            "type": "chat_response",
+                            "openid": openid,
+                            "content": self._build_self_healing_message("permission_denied", error_text),
+                            "client_version": CLIENT_VERSION
+                        })
+                    
+                    elif response.status_code in (502, 503):
+                        # 服务不可用
+                        error_detail = await response.aread()
+                        error_text = error_detail.decode('utf-8') if error_detail else ""
+                        logger.error(f"[API] {response.status_code} 错误: 服务不可用")
+                        logger.error(f"[API] 响应内容: {error_text[:200]}")
+                        await self.send_message({
+                            "type": "chat_response",
+                            "openid": openid,
+                            "content": self._build_self_healing_message("service_unavailable", error_text),
+                            "client_version": CLIENT_VERSION
+                        })
+                    
+                    else:
+                        # 其他错误
+                        error_detail = await response.aread()
+                        error_text = error_detail.decode('utf-8') if error_detail else ""
+                        logger.error(f"[API] 错误 {response.status_code}")
+                        await self.send_message({
+                            "type": "chat_response",
+                            "openid": openid,
+                            "content": self._build_self_healing_message("unknown", f"HTTP {response.status_code}: {error_text}"),
+                            "client_version": CLIENT_VERSION
+                        })
+
+        except httpx.ConnectError:
+            logger.error(f"[API] 连接失败: 无法连接到 {self.openclaw_url}")
+            logger.error(f"[API] 请检查: 1) OpenClaw 是否运行 2) 端口是否正确 3) 防火墙设置")
+            await self.send_message({
+                "type": "chat_response",
+                "openid": openid,
+                "content": self._build_self_healing_message("connection_failed"),
+                "client_version": CLIENT_VERSION
+            })
+        
+        except Exception as e:
+            logger.error(f"[API] 流式响应错误: {type(e).__name__}: {e}")
+            await self.send_message({
+                "type": "chat_response",
+                "openid": openid,
+                "content": self._build_self_healing_message("unknown", str(e)),
+                "client_version": CLIENT_VERSION
+            })
+
+    def _build_self_healing_message(self, error_type: str, error_detail: str = "") -> str:
         """构建自愈指引消息
         
         返回包含三部分的消息：
         1. 问题描述（通俗语言）
         2. 解决方法（用户复制粘贴给 OpenClaw 即可触发自愈）
         3. 原因分析（供 AI 理解，非用户阅读）
+        
+        Args:
+            error_type: 错误类型
+            error_detail: 错误详情（如响应内容）
         """
         if error_type == "chat_api_disabled":
             return """⚠️ 需要启用 API 接口
@@ -782,11 +963,129 @@ OpenClaw 的微信对话接口未启用，导致消息无法正常处理。
 【原因分析】
 技术细节：Gateway 的 /v1/chat/completions 端点默认禁用。OpenClaw 升级或配置重置后可能恢复默认设置。启用该端点后，微信频道插件才能正常调用 AI 对话能力。"""
         
-        elif error_type == "auth_failed":
-            return """⚠️ 认证配置需要更新
+        elif error_type == "auth_token_missing":
+            return """⚠️ Gateway Token 未配置
 
 【问题描述】
-OpenClaw Gateway 的认证配置不正确，导致请求被拒绝。
+请求未携带 Gateway Token，导致认证失败（HTTP 401）。
+
+**具体原因**：客户端未找到有效的认证 Token
+- 环境变量 OPENCLAW_API_KEY 未设置
+- Gateway 配置文件中未启用 token 认证模式
+
+【解决方法】
+
+**方法一：配置环境变量（推荐）**
+在 systemd service 文件中添加：
+```bash
+Environment="OPENCLAW_API_KEY=<your-token>"
+```
+然后重载服务：
+```bash
+systemctl --user daemon-reload
+systemctl --user restart openclaw-wechat-channel
+```
+
+**方法二：检查 Gateway 配置**
+1. 检查 Gateway 认证配置：
+   ```bash
+   cat ~/.openclaw/openclaw.json | jq '.gateway.auth'
+   ```
+2. 确认 `auth.mode` 和 `auth.token` 是否正确配置
+
+【诊断步骤】
+```bash
+# 1. 检查环境变量
+echo $OPENCLAW_API_KEY
+
+# 2. 检查 Gateway 配置
+cat ~/.openclaw/openclaw.json | jq '.gateway.auth'
+
+# 3. 检查服务环境变量
+systemctl --user show openclaw-wechat-channel | grep Environment
+```
+
+【原因分析】
+技术细节：客户端在调用 Gateway API 时未提供认证 Token。客户端会自动从 ~/.openclaw/openclaw.json 读取 gateway.auth.token，或从环境变量 OPENCLAW_API_KEY 读取。如果两者都未配置，则会收到 401 错误。
+
+【相关文件】
+- Gateway 配置：~/.openclaw/openclaw.json
+- 服务配置：~/.config/systemd/user/openclaw-wechat-channel.service"""
+        
+        elif error_type == "auth_token_invalid":
+            return f"""⚠️ Gateway Token 无效或已过期
+
+【问题描述】
+Gateway Token 无效或已过期，导致认证失败（HTTP 401）。
+
+**具体原因**：提供的 Token 与 Gateway 配置不匹配
+- Token 可能已更改
+- Token 格式错误
+- 客户端使用了过期的 Token
+
+【服务器返回】
+```
+{error_detail[:200]}
+```
+
+【解决方法】
+
+**方法一：同步 Token**
+1. 检查 Gateway 当前配置的 Token：
+   ```bash
+   cat ~/.openclaw/openclaw.json | jq '.gateway.auth.token'
+   ```
+2. 更新环境变量：
+   ```bash
+   export OPENCLAW_API_KEY="<正确的-token>"
+   ```
+3. 或在服务配置中更新：
+   ```bash
+   systemctl --user edit openclaw-wechat-channel
+   # 添加：Environment="OPENCLAW_API_KEY=<正确的-token>"
+   ```
+
+**方法二：暂时关闭认证（仅测试用）**
+修改 Gateway 配置：
+```json
+{
+  "gateway": {
+    "auth": {
+      "mode": "none"
+    }
+  }
+}
+```
+
+【诊断步骤】
+```bash
+# 1. 检查 Gateway 配置的 Token
+cat ~/.openclaw/openclaw.json | jq '.gateway.auth'
+
+# 2. 检查客户端使用的 Token
+echo $OPENCLAW_API_KEY
+
+# 3. 测试 Token 是否有效
+curl -H "Authorization: Bearer $OPENCLAW_API_KEY" http://127.0.0.1:18789/v1/models
+```
+
+【原因分析】
+技术细节：客户端携带的 Token 与 Gateway 配置的 gateway.auth.token 不匹配。可能是 Gateway 配置被更新，但客户端未同步更新 Token。
+
+【相关文件】
+- Gateway 配置：~/.openclaw/openclaw.json
+- 服务配置：~/.config/systemd/user/openclaw-wechat-channel.service"""
+        
+        elif error_type == "auth_failed":
+            return f"""⚠️ Gateway 认证失败
+
+【问题描述】
+OpenClaw Gateway 认证失败（HTTP 401）。
+
+【服务器返回】
+```
+{error_detail[:200]}
+```
 
 【解决方法】
 请复制以下内容，发送给 OpenClaw 对话框：
@@ -798,21 +1097,139 @@ OpenClaw Gateway 的认证配置不正确，导致请求被拒绝。
 【原因分析】
 技术细节：Gateway auth token 不匹配或过期。需要检查 gateway.auth.token 配置。"""
         
-        elif error_type == "connection_failed":
-            return f"""⚠️ 无法连接到 OpenClaw
+        elif error_type == "permission_denied":
+            return """⚠️ 权限不足
 
 【问题描述】
-无法连接到 OpenClaw 服务（{self.openclaw_url}），请确认 OpenClaw 是否正在运行。
+请求被 Gateway 拒绝（HTTP 403），可能是 IP 白名单或权限配置问题。
 
 【解决方法】
-1. 确保 OpenClaw 已启动（终端运行 `openclaw gateway` 或打开 OpenClaw 应用）
-2. 检查端口 {self.openclaw_url.split(':')[-1] if ':' in self.openclaw_url else '18789'} 是否正确
+
+**方法一：检查 IP 白名单**
+```bash
+# 查看当前 IP 白名单配置
+cat ~/.openclaw/openclaw.json | jq '.gateway.security.ipWhitelist'
+```
+
+**方法二：暂时关闭 IP 限制（仅测试用）**
+修改 Gateway 配置，清空或关闭 IP 白名单。
+
+【诊断步骤】
+```bash
+# 检查 Gateway 安全配置
+cat ~/.openclaw/openclaw.json | jq '.gateway.security'
+```
 
 【原因分析】
-技术细节：HTTP 连接失败，可能是 OpenClaw 未启动、端口不匹配或防火墙阻止。"""
+技术细节：Gateway 可能配置了 IP 白名单，当前请求来源 IP 不在允许列表中。
+
+【相关文件】
+- Gateway 配置：~/.openclaw/openclaw.json"""
+        
+        elif error_type == "service_unavailable":
+            return f"""⚠️ Gateway 服务不可用
+
+【问题描述】
+OpenClaw Gateway 服务暂时不可用（HTTP 502/503）。
+
+【服务器返回】
+```
+{error_detail[:200]}
+```
+
+【解决方法】
+
+**方法一：检查 Gateway 服务状态**
+```bash
+# 检查服务是否运行
+openclaw gateway status
+
+# 如果未运行，启动服务
+openclaw gateway start
+
+# 或通过 systemd 管理
+systemctl --user status openclaw-gateway
+systemctl --user start openclaw-gateway
+```
+
+**方法二：检查 Gateway 日志**
+```bash
+# 查看最近的错误日志
+journalctl --user -u openclaw-gateway -n 50 --no-pager
+```
+
+【原因分析】
+技术细节：Gateway 服务可能已崩溃、正在重启，或后端服务（如 AI 模型）不可用。
+
+【相关文件】
+- Gateway 日志：journalctl --user -u openclaw-gateway"""
+        
+        elif error_type == "connection_failed":
+            return f"""⚠️ 无法连接到 Gateway
+
+【问题描述】
+无法连接到 OpenClaw Gateway 服务（{self.openclaw_url}）。
+
+【具体原因】
+- Gateway 服务未启动
+- 端口配置错误
+- 防火墙阻止连接
+
+【解决方法】
+
+**方法一：检查服务状态**
+```bash
+# 检查 Gateway 是否运行
+openclaw gateway status
+
+# 如果未运行，启动服务
+openclaw gateway start
+```
+
+**方法二：检查端口**
+```bash
+# 检查端口是否被监听
+netstat -tlnp | grep 18789
+# 或
+ss -tlnp | grep 18789
+
+# 检查 Gateway 配置的端口
+cat ~/.openclaw/openclaw.json | jq '.gateway.http.port'
+```
+
+**方法三：检查防火墙**
+```bash
+# 检查防火墙状态
+sudo ufw status
+
+# 如果需要，开放端口
+sudo ufw allow 18789/tcp
+```
+
+【诊断步骤】
+```bash
+# 1. 测试端口连通性
+curl -v http://127.0.0.1:18789/v1/models
+
+# 2. 检查服务进程
+ps aux | grep openclaw
+
+# 3. 检查 Gateway 日志
+journalctl --user -u openclaw-gateway -n 20 --no-pager
+```
+
+【原因分析】
+技术细节：HTTP 连接失败，可能是 Gateway 未启动、端口不匹配或防火墙阻止。
+
+【相关文件】
+- Gateway 配置：~/.openclaw/openclaw.json
+- Gateway 日志：journalctl --user -u openclaw-gateway"""
         
         else:
-            return """⚠️ 未知错误
+            return f"""⚠️ 未知错误
+
+【错误详情】
+{error_detail[:500] if error_detail else "无详细信息"}
 
 请发送 /status 查看连接状态，或联系技术支持。"""
 
